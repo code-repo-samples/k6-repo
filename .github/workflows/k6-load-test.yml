@@ -1,0 +1,70 @@
+name: k6 Serverless Performance Test
+
+on:
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+    inputs:
+      app_folder:
+        description: 'Folder in repo containing k6 scripts'
+        required: true
+        default: 'order-service'
+      script_name:
+        description: 'The .js file to run'
+        required: true
+        default: 'load-test.js'
+
+permissions:
+  id-token: write # Required for OIDC
+  contents: read
+
+jobs:
+  run-k6:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: "loadtestplatformgeminiv3"
+      BUCKET: "k6-performance-test-artifacts"
+      REGION: "us-central1"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/335825352278/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'k6-runner@loadtestplatformgeminiv3.iam.gserviceaccount.com'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Generate Run ID
+        run: echo "RUN_ID=run-${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_ENV
+
+      - name: 📥 Upload Scripts to GCS
+        run: |
+          # Syncs the local app folder to the GCS "scripts" directory for this run
+          gsutil -m cp -r ./${{ github.event.inputs.app_folder }}/* gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/scripts/
+
+      - name: 🚀 Execute k6 Cloud Run Job
+        run: |
+          gcloud run jobs execute k6-enterprise-runner \
+            --region=${{ env.REGION }} \
+            --wait \
+            --update-env-vars="RUN_ID=${{ env.RUN_ID }},APP_FOLDER=${{ github.event.inputs.app_folder }},SCRIPT_NAME=${{ github.event.inputs.script_name }}"
+
+      - name: 📤 Download Results & Generate Summary
+        if: always() # Ensure we get logs even if k6 fails
+        run: |
+          gsutil -m cp -r gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/* ./results/
+          
+          echo "## 📊 k6 Load Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat ./results/summary.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload HTML Report as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-html-report-${{ env.RUN_ID }}
+          path: ./results/*.html

@@ -60,7 +60,8 @@ jobs:
           
           # 2. Download from GCS
           # We use -r to ensure recursive download and /* to get the contents
-          gsutil -m cp -r "gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/*" ./results/
+          # gsutil -m cp -r "gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/*" ./results/
+          gsutil -m cp -r "gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/." ./results/
           
           # 3. Print the summary to the GitHub Job Summary page
           echo "## 📊 k6 Load Test Summary" >> $GITHUB_STEP_SUMMARY
@@ -71,17 +72,13 @@ jobs:
           else
             echo "⚠️ summary.txt not found in results." >> $GITHUB_STEP_SUMMARY
           fi
-        # run: |
-        #   gsutil -m cp -r gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/* ./results/
-          
-        #   echo "## 📊 k6 Load Test Summary" >> $GITHUB_STEP_SUMMARY
-        #   echo '```' >> $GITHUB_STEP_SUMMARY
-        #   cat ./results/summary.txt >> $GITHUB_STEP_SUMMARY
-        #   echo '```' >> $GITHUB_STEP_SUMMARY
+        
 
       - name: Upload HTML Report as Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: k6-html-report-${{ env.RUN_ID }}
-          path: ./results/*.html
+          # name: k6-html-report-${{ env.RUN_ID }}
+          # path: ./results/*.html
+          name: k6-results-${{ env.RUN_ID }}
+          path: ./results/

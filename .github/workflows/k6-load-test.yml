@@ -10,7 +10,7 @@ on:
       script_name:
         description: 'The .js file to run'
         required: true
-        default: 'load-test.js'
+        default: 'test-script.js'
 
 permissions:
   id-token: write # Required for OIDC
@@ -55,12 +55,29 @@ jobs:
       - name: 📤 Download Results & Generate Summary
         if: always() # Ensure we get logs even if k6 fails
         run: |
-          gsutil -m cp -r gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/* ./results/
+          # 1. Create the local directory first (The Fix)
+          mkdir -p ./results
           
+          # 2. Download from GCS
+          # We use -r to ensure recursive download and /* to get the contents
+          gsutil -m cp -r "gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/*" ./results/
+          
+          # 3. Print the summary to the GitHub Job Summary page
           echo "## 📊 k6 Load Test Summary" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat ./results/summary.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          if [ -f "./results/summary.txt" ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat ./results/summary.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ summary.txt not found in results." >> $GITHUB_STEP_SUMMARY
+          fi
+        # run: |
+        #   gsutil -m cp -r gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/* ./results/
+          
+        #   echo "## 📊 k6 Load Test Summary" >> $GITHUB_STEP_SUMMARY
+        #   echo '```' >> $GITHUB_STEP_SUMMARY
+        #   cat ./results/summary.txt >> $GITHUB_STEP_SUMMARY
+        #   echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload HTML Report as Artifact
         if: always()

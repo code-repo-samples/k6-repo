@@ -33,7 +33,7 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: "${{ env.WID_PROVIDER }}"
-          service_account: 'k6-runner@{{ env.PROJECT_ID }}.iam.gserviceaccount.com'
+          service_account: "k6-runner@${{ env.PROJECT_ID }}.iam.gserviceaccount.com"
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2

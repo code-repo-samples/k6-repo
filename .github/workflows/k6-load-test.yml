@@ -10,7 +10,7 @@ on:
       script_name:
         description: 'The .js file to run'
         required: true
-        default: 'test-script.js'
+        default: 'test-script_csv.js'
 
 permissions:
   id-token: write # Required for OIDC
@@ -20,7 +20,8 @@ jobs:
   run-k6:
     runs-on: ubuntu-latest
     env:
-      PROJECT_ID: "loadtestplatformgeminiv3"
+      PROJECT_ID: "${{ secrets.GCP_PROJECT_ID }}" #"loadtestplatformgeminiv3"
+      WID_PROVIDER: "${{ vars.GCP_WID_PROVIDER }}" #'projects/335825352278/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
       BUCKET: "k6-performance-test-artifacts"
       REGION: "us-central1"
 
@@ -31,8 +32,8 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: 'projects/335825352278/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
-          service_account: 'k6-runner@loadtestplatformgeminiv3.iam.gserviceaccount.com'
+          workload_identity_provider: "${{ env.WID_PROVIDER }}"
+          service_account: 'k6-runner@{{ env.PROJECT_ID }}.iam.gserviceaccount.com'
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
@@ -50,7 +51,8 @@ jobs:
           gcloud run jobs execute k6-enterprise-runner \
             --region=${{ env.REGION }} \
             --wait \
-            --update-env-vars="RUN_ID=${{ env.RUN_ID }},APP_FOLDER=${{ github.event.inputs.app_folder }},SCRIPT_NAME=${{ github.event.inputs.script_name }}"
+            --update-env-vars="RUN_ID=${{ env.RUN_ID }},APP_FOLDER=${{ github.event.inputs.app_folder }},SCRIPT_NAME=${{ github.event.inputs.script_name }},\
+            AUTH_HEADER=${{ secrets.AUTH_HEADER }}"
 
       - name: 📤 Download Results & Generate Summary
         if: always() # Ensure we get logs even if k6 fails
@@ -60,8 +62,8 @@ jobs:
           
           # 2. Download from GCS
           # We use -r to ensure recursive download and /* to get the contents
-          # gsutil -m cp -r "gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/*" ./results/
-          gsutil -m cp -r "gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/." ./results/
+          gsutil -m cp -r "gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/*" ./results/
+          # gsutil -m cp -r "gs://${{ env.BUCKET }}/${{ env.RUN_ID }}/results/." ./results/
           
           # 3. Print the summary to the GitHub Job Summary page
           echo "## 📊 k6 Load Test Summary" >> $GITHUB_STEP_SUMMARY

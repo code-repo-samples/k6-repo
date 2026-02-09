@@ -6,7 +6,7 @@ import papaparse from 'https://jslib.k6.io/papaparse/5.1.1/index.js';
 // 1. Load CSV data into a SharedArray (efficient for many VUs)
 const csvData = new SharedArray('user data', function () {
   // We assume 'data.csv' is uploaded to the same folder as this script
-  return papaparse.parse(open('./data.csv'), { header: true }).data;
+  return papaparse.parse(open('../data/data.csv'), { header: true }).data;
 });
 
 // 2. Capture the AuthHeader from the environment (passed via Cloud Run)

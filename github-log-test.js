@@ -1,65 +1,93 @@
 import http from 'k6/http';
-import { sleep } from 'k6';
+import { check } from 'k6';
+import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.2/index.js';
 
-/**
- * k6 load test configuration.
- *
- * We use a constant arrival rate executor to strictly control TPS.
- * - rate: 2  → 2 iterations per second (2 TPS)
- * - timeUnit: '1s' → rate is measured per second
- * - duration: '30s' → test runs for 30 seconds
- * - preAllocatedVUs: Pre-creates virtual users to handle load
- * - maxVUs: Maximum VUs allowed if scaling is needed
- */
-export const options = {
+// Track last phase for logging
+let lastPhase = '';
+
+export let options = {
   scenarios: {
-    controlled_tps: {
-      executor: 'constant-arrival-rate',
-      rate: 2,              // 2 iterations per second (2 TPS)
-      timeUnit: '1s',
-      duration: '30m',
-      preAllocatedVUs: 5,
-      maxVUs: 10,
+    tps_test: {
+      executor: 'ramping-arrival-rate',
+      startRate: 2,      // starting TPS
+      timeUnit: '1s',    // rate is per second
+      stages: [
+        // Steady 2 TPS
+        { target: 2, duration: '1m', tags: { phase: 'steady_2_tps' } },
+
+        // Ramp to 10 TPS
+        { target: 10, duration: '2m', tags: { phase: 'ramp_to_10_tps' } },
+
+        // Steady 10 TPS
+        { target: 10, duration: '1m', tags: { phase: 'steady_10_tps' } },
+
+        // Ramp to 20 TPS
+        { target: 20, duration: '2m', tags: { phase: 'ramp_to_20_tps' } },
+
+        // Steady 20 TPS
+        { target: 20, duration: '1m', tags: { phase: 'steady_20_tps' } },
+
+        // Ramp down to 0 TPS
+        { target: 0, duration: '1m', tags: { phase: 'ramp_down' } },
+      ],
+      preAllocatedVUs: 50,   // estimate based on expected TPS * response time
+      maxVUs: 200,
     },
   },
 };
 
 /**
- * Default function executed per iteration.
- *
- * Each iteration:
- * 1. Runs a loop 50 times
- * 2. Prints multiple console logs per loop iteration
- * 3. Makes a simple HTTP request
- *
- * Even at 2 TPS, heavy logging inside loops
- * can generate thousands of log lines quickly.
+ * Returns the current stage tag based on scenario progress
  */
+function getCurrentPhase() {
+  const stages = options.scenarios.tps_test.stages;
+  const totalDurationSec = stages.reduce((sum, s) => sum + parseDuration(s.duration), 0);
+  const elapsedSec = __ITER / 2; // rough estimate (per VU)
+  let cumulative = 0;
+  for (let stage of stages) {
+    cumulative += parseDuration(stage.duration);
+    if (elapsedSec <= cumulative) {
+      return stage.tags.phase;
+    }
+  }
+  return stages[stages.length - 1].tags.phase;
+}
+
+/**
+ * Converts duration strings to seconds
+ */
+function parseDuration(dur) {
+  if (dur.endsWith('s')) return parseInt(dur);
+  if (dur.endsWith('m')) return parseInt(dur) * 60;
+  return parseInt(dur);
+}
+
 export default function () {
-  console.log(`Starting iteration at ${new Date().toISOString()}`);
-
-  // Loop that generates a lot of logs
-  for (let i = 1; i <= 100; i++) {
-
-    // Example log line #1
-    console.log(`Loop ${i}: Preparing request payload`);
-
-    // Example log line #2
-    console.log(`Loop ${i}: Sending HTTP GET request`);
-
-    // Perform a sample HTTP request
-    const response = http.get('https://test.k6.io');
-
-    // Example log line #3
-    console.log(`Loop ${i}: Received status ${response.status}`);
-
-    // Example log line #4
-    console.log(`Loop ${i}: Response length ${response.body.length}`);
+  // Track phase transitions for minimal logging
+  const phase = getCurrentPhase();
+  if (phase !== lastPhase) {
+    lastPhase = phase;
+    console.log(`>>> Entering phase: ${phase}`);
   }
 
-  console.log(`Finished iteration at ${new Date().toISOString()}`);
+  // API 1: Always runs
+  let getResp = http.get('https://jsonplaceholder.typicode.com/posts/1', { tags: { phase } });
+  check(getResp, { 'GET status 200': (r) => r.status === 200 });
 
-  // Small sleep to simulate think time (not required for TPS control,
-  // since constant-arrival-rate already enforces 2 TPS)
-  sleep(0.1);
+  // API 2: 50% of iterations
+  if (Math.random() < 0.5) {
+    let payload = JSON.stringify({ title: 'foo', body: 'bar', userId: 1 });
+    let params = { headers: { 'Content-Type': 'application/json' }, tags: { phase } };
+    let postResp = http.post('https://jsonplaceholder.typicode.com/posts', payload, params);
+    check(postResp, { 'POST status 201': (r) => r.status === 201 });
+  }
+}
+
+/**
+ * Custom summary output
+ */
+export function handleSummary(data) {
+  return {
+    stdout: textSummary(data, { indent: ' ', enableColors: true }),
+  };
 }

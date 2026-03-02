@@ -1,10 +1,7 @@
 name: GitHub Log Stress Test
 
 on:
-  workflow_dispatch:   # Manual trigger
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   log-test:

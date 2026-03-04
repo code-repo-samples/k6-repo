@@ -1,0 +1,479 @@
+#!/usr/bin/env node
+/**
+ * k6 Summary JSON Merger
+ *
+ * Usage:
+ *   node merge-k6-summaries.js file1.json file2.json ... [--output merged.json] [--mode sequential|parallel]
+ *
+ * --mode sequential  (default) Runs one after another → VUs = max
+ * --mode parallel    Runs at same time               → VUs = sum
+ */
+
+const fs = require("fs");
+
+// ─── CLI ─────────────────────────────────────────────────────────────────────
+
+const rawArgs = process.argv.slice(2);
+let mode = "sequential";
+let outputFile = "merged-k6-summary.json";
+const inputFiles = [];
+
+for (let i = 0; i < rawArgs.length; i++) {
+  if (rawArgs[i] === "--output") { outputFile = rawArgs[++i]; }
+  else if (rawArgs[i] === "--mode") {
+    const m = rawArgs[++i];
+    if (!["sequential", "parallel"].includes(m)) {
+      console.error(`❌ Invalid mode "${m}". Use: sequential | parallel`); process.exit(1);
+    }
+    mode = m;
+  } else { inputFiles.push(rawArgs[i]); }
+}
+
+if (inputFiles.length < 1) {
+  console.error("Usage: node merge-k6-summaries.js file1.json file2.json [--output out.json] [--mode sequential|parallel]");
+  process.exit(1);
+}
+for (const f of inputFiles) {
+  if (!fs.existsSync(f)) { console.error(`❌ File not found: ${f}`); process.exit(1); }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+const VUS_METRICS     = new Set(["vus", "vus_max"]);
+const COUNTER_METRICS = new Set(["http_reqs", "iterations", "data_received", "data_sent"]);
+const RATIO_METRICS   = new Set(["checks", "http_req_failed"]);
+
+function weightedAvg(instances, field, weights) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  if (total === 0) return 0;
+  return instances.reduce((acc, m, i) => acc + (m[field] ?? 0) * weights[i], 0) / total;
+}
+
+function mergeMetric(key, instances, reqCounts, iterCounts, mode) {
+  const result = {};
+  const isVus    = VUS_METRICS.has(key);
+  const isRatio  = RATIO_METRICS.has(key);
+  const isTiming = !isVus && !COUNTER_METRICS.has(key) && !isRatio;
+  const weights  = isTiming ? reqCounts : iterCounts;
+
+  if ("min"    in instances[0]) result.min      = Math.min(...instances.map(m => m.min));
+  if ("max"    in instances[0]) result.max      = Math.max(...instances.map(m => m.max));
+  if ("avg"    in instances[0]) result.avg      = weightedAvg(instances, "avg",    weights);
+  if ("med"    in instances[0]) result.med      = weightedAvg(instances, "med",    weights);
+  if ("p(90)"  in instances[0]) result["p(90)"] = weightedAvg(instances, "p(90)", weights);
+  if ("p(95)"  in instances[0]) result["p(95)"] = weightedAvg(instances, "p(95)", weights);
+  if ("count"  in instances[0]) result.count    = instances.reduce((s, m) => s + (m.count  ?? 0), 0);
+  if ("rate"   in instances[0]) result.rate     = instances.reduce((s, m) => s + (m.rate   ?? 0), 0);
+  if ("passes" in instances[0]) result.passes   = instances.reduce((s, m) => s + (m.passes ?? 0), 0);
+  if ("fails"  in instances[0]) result.fails    = instances.reduce((s, m) => s + (m.fails  ?? 0), 0);
+
+  if ("value" in instances[0]) {
+    if (isRatio) {
+      const total = (result.passes ?? 0) + (result.fails ?? 0);
+      result.value = total > 0 ? result.passes / total : 0;
+    } else if (isVus) {
+      result.value = mode === "parallel"
+        ? instances.reduce((s, m) => s + (m.value ?? 0), 0)
+        : Math.max(...instances.map(m => m.value ?? 0));
+    } else {
+      result.value = instances.reduce((s, m) => s + (m.value ?? 0), 0);
+    }
+  }
+  return result;
+}
+
+function mergeChecks(checksArray) {
+  const merged = {};
+  const allNames = new Set(checksArray.flatMap(c => Object.keys(c)));
+  for (const name of allNames) {
+    const instances = checksArray.map(c => c[name]).filter(Boolean);
+    merged[name] = {
+      name:   instances[0].name,
+      path:   instances[0].path,
+      id:     instances[0].id,
+      passes: instances.reduce((s, x) => s + (x.passes ?? 0), 0),
+      fails:  instances.reduce((s, x) => s + (x.fails  ?? 0), 0),
+    };
+  }
+  return merged;
+}
+
+// ─── Merge ───────────────────────────────────────────────────────────────────
+
+const summaries  = inputFiles.map(f => JSON.parse(fs.readFileSync(f, "utf8")));
+const reqCounts  = summaries.map(s => s.metrics?.http_reqs?.count  || 1);
+const iterCounts = summaries.map(s => s.metrics?.iterations?.count || 1);
+
+const allMetricKeys = new Set(summaries.flatMap(s => Object.keys(s.metrics || {})));
+const mergedMetrics = {};
+for (const key of allMetricKeys) {
+  const instances = summaries.map(s => s.metrics?.[key]).filter(Boolean);
+  if (instances.length > 0) mergedMetrics[key] = mergeMetric(key, instances, reqCounts, iterCounts, mode);
+}
+
+const rootGroups = summaries.map(s => s.root_group).filter(Boolean);
+const firstGroup = rootGroups[0] || {};
+const mergedRootGroup = {
+  name:   firstGroup.name   ?? "",
+  path:   firstGroup.path   ?? "",
+  id:     firstGroup.id     ?? "",
+  groups: firstGroup.groups ?? {},
+  checks: mergeChecks(rootGroups.map(g => g.checks || {})),
+};
+
+// ── Output JSON — same shape as input files ──
+const merged = {
+  root_group: mergedRootGroup,
+  metrics: mergedMetrics,
+};
+
+fs.writeFileSync(outputFile, JSON.stringify(merged, null, 4), "utf8");
+
+// ─── Console Analysis Table ───────────────────────────────────────────────────
+
+const m = merged.metrics;
+const checks = mergedRootGroup.checks;
+const W = 68;
+const line  = "─".repeat(W);
+const dline = "═".repeat(W);
+
+function pad(str, len, right = false) {
+  str = String(str);
+  if (right) return str.padStart(len);
+  return str.padEnd(len);
+}
+
+function row(label, value, note = "") {
+  const l = pad(label, 36);
+  const v = pad(value, 18, true);
+  const n = note ? `   ${note}` : "";
+  console.log(`│  ${l}${v}  │${n}`);
+}
+
+function sectionHeader(title) {
+  console.log(`├${line}┤`);
+  const spaces = W - 2 - title.length;
+  const left = Math.floor(spaces / 2);
+  const right = spaces - left;
+  console.log(`│ ${" ".repeat(left)}${title}${" ".repeat(right)} │`);
+  console.log(`├${"─".repeat(W)}┤`);
+}
+
+function blank() {
+  console.log(`│${" ".repeat(W)}│`);
+}
+
+// Header
+console.log(`\n╔${dline}╗`);
+const hdr = "k6 MERGED PERFORMANCE REPORT";
+const hp = Math.floor((W - hdr.length) / 2);
+console.log(`║${" ".repeat(hp)}${hdr}${" ".repeat(W - hp - hdr.length)}║`);
+console.log(`╚${dline}╝`);
+
+console.log(`┌${line}┐`);
+row("Mode",         mode === "parallel" ? "PARALLEL (VUs summed)" : "SEQUENTIAL (VUs max'd)");
+row("Files merged", inputFiles.length);
+row("Output",       outputFile);
+blank();
+
+sectionHeader("TRAFFIC SUMMARY");
+row("Total HTTP Requests",  m.http_reqs?.count?.toLocaleString() ?? "N/A");
+row("Request Rate",         `${(m.http_reqs?.rate ?? 0).toFixed(2)} req/s`);
+row("Total Iterations",     m.iterations?.count?.toLocaleString() ?? "N/A");
+row("Iteration Rate",       `${(m.iterations?.rate ?? 0).toFixed(2)} iter/s`);
+row("Data Received",        `${((m.data_received?.count||0)/1024).toFixed(1)} KB  @  ${((m.data_received?.rate||0)/1024).toFixed(1)} KB/s`);
+row("Data Sent",            `${((m.data_sent?.count||0)/1024).toFixed(1)} KB  @  ${((m.data_sent?.rate||0)/1024).toFixed(1)} KB/s`);
+blank();
+
+sectionHeader("HTTP REQUEST DURATION (ms)");
+row("Average",  (m.http_req_duration?.avg ?? 0).toFixed(3));
+row("Median",   (m.http_req_duration?.med ?? 0).toFixed(3),          "⚠ approx");
+row("Min",      (m.http_req_duration?.min ?? 0).toFixed(3));
+row("Max",      (m.http_req_duration?.max ?? 0).toFixed(3));
+row("p(90)",    (m.http_req_duration?.["p(90)"] ?? 0).toFixed(3),    "⚠ approx");
+row("p(95)",    (m.http_req_duration?.["p(95)"] ?? 0).toFixed(3),    "⚠ approx");
+blank();
+
+sectionHeader("REQUEST PHASE BREAKDOWN (avg ms)");
+row("Blocked",         (m.http_req_blocked?.avg         ?? 0).toFixed(3));
+row("Connecting",      (m.http_req_connecting?.avg      ?? 0).toFixed(3));
+row("TLS Handshaking", (m.http_req_tls_handshaking?.avg ?? 0).toFixed(3));
+row("Sending",         (m.http_req_sending?.avg         ?? 0).toFixed(3));
+row("Waiting (TTFB)",  (m.http_req_waiting?.avg         ?? 0).toFixed(3));
+row("Receiving",       (m.http_req_receiving?.avg       ?? 0).toFixed(3));
+blank();
+
+sectionHeader("CHECKS");
+for (const [, c] of Object.entries(checks)) {
+  const total = c.passes + c.fails;
+  const pct   = total > 0 ? ((c.passes / total) * 100).toFixed(1) : "0.0";
+  const icon  = c.fails === 0 ? "✔" : "✘";
+  row(`${icon}  ${c.name}`, `${c.passes} / ${total}`, `${pct}%`);
+}
+row("Total passes",  m.checks?.passes ?? 0);
+row("Total fails",   m.checks?.fails  ?? 0);
+blank();
+
+sectionHeader("VIRTUAL USERS");
+row(`Active VUs  (${mode === "parallel" ? "summed" : "max'd"})`, m.vus?.value     ?? "N/A");
+row(`Max VUs     (${mode === "parallel" ? "summed" : "max'd"})`, m.vus_max?.value ?? "N/A");
+blank();
+
+console.log(`└${line}┘`);
+console.log(`\n  ✅  Merged JSON  →  ${outputFile}`);
+console.log("  ⚠   med / p(90) / p(95) are weighted approximations\n");
+
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------
+
+
+
+#!/usr/bin/env node
+/**
+ * k6 Summary JSON Merger + Report
+ *
+ * Usage:
+ *   node merge-k6-summaries.js file1.json file2.json ... [--output merged.json] [--mode sequential|parallel]
+ *
+ * To get per-API rows in k6, tag your requests:
+ *   http.get(url, { tags: { name: 'GET /prod/get/secure' } })
+ *
+ * --mode sequential  (default) Runs one after another → VUs = max
+ * --mode parallel    Runs at same time               → VUs = sum
+ */
+
+const fs = require("fs");
+
+// ─── CLI ─────────────────────────────────────────────────────────────────────
+
+const rawArgs = process.argv.slice(2);
+let mode = "sequential";
+let outputFile = "merged-k6-summary.json";
+const inputFiles = [];
+
+for (let i = 0; i < rawArgs.length; i++) {
+  if (rawArgs[i] === "--output") { outputFile = rawArgs[++i]; }
+  else if (rawArgs[i] === "--mode") {
+    const m = rawArgs[++i];
+    if (!["sequential", "parallel"].includes(m)) {
+      console.error(`Invalid mode "${m}". Use: sequential | parallel`); process.exit(1);
+    }
+    mode = m;
+  } else { inputFiles.push(rawArgs[i]); }
+}
+
+if (inputFiles.length < 1) {
+  console.error("Usage: node merge-k6-summaries.js file1.json file2.json [--output out.json] [--mode sequential|parallel]");
+  process.exit(1);
+}
+for (const f of inputFiles) {
+  if (!fs.existsSync(f)) { console.error(`File not found: ${f}`); process.exit(1); }
+}
+
+// ─── Merge helpers ────────────────────────────────────────────────────────────
+
+const VUS_METRICS     = new Set(["vus", "vus_max"]);
+const COUNTER_METRICS = new Set(["http_reqs", "iterations", "data_received", "data_sent"]);
+const RATIO_METRICS   = new Set(["checks", "http_req_failed"]);
+
+function weightedAvg(instances, field, weights) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  if (total === 0) return 0;
+  return instances.reduce((acc, m, i) => acc + (m[field] ?? 0) * weights[i], 0) / total;
+}
+
+function mergeMetric(key, instances, reqCounts, iterCounts) {
+  const result  = {};
+  const baseKey = key.replace(/\{[^}]+\}/, "");
+  const isVus    = VUS_METRICS.has(baseKey);
+  const isRatio  = RATIO_METRICS.has(baseKey);
+  const isTiming = !isVus && !COUNTER_METRICS.has(baseKey) && !isRatio;
+  const weights  = isTiming ? reqCounts : iterCounts;
+
+  if ("min"    in instances[0]) result.min      = Math.min(...instances.map(m => m.min));
+  if ("max"    in instances[0]) result.max      = Math.max(...instances.map(m => m.max));
+  if ("avg"    in instances[0]) result.avg      = weightedAvg(instances, "avg",    weights);
+  if ("med"    in instances[0]) result.med      = weightedAvg(instances, "med",    weights);
+  if ("p(90)"  in instances[0]) result["p(90)"] = weightedAvg(instances, "p(90)", weights);
+  if ("p(95)"  in instances[0]) result["p(95)"] = weightedAvg(instances, "p(95)", weights);
+  if ("p(99)"  in instances[0]) result["p(99)"] = weightedAvg(instances, "p(99)", weights);
+  if ("count"  in instances[0]) result.count    = instances.reduce((s, m) => s + (m.count  ?? 0), 0);
+  if ("rate"   in instances[0]) result.rate     = instances.reduce((s, m) => s + (m.rate   ?? 0), 0);
+  if ("passes" in instances[0]) result.passes   = instances.reduce((s, m) => s + (m.passes ?? 0), 0);
+  if ("fails"  in instances[0]) result.fails    = instances.reduce((s, m) => s + (m.fails  ?? 0), 0);
+
+  if ("value" in instances[0]) {
+    if (isRatio) {
+      const total = (result.passes ?? 0) + (result.fails ?? 0);
+      result.value = total > 0 ? result.passes / total : 0;
+    } else if (isVus) {
+      result.value = mode === "parallel"
+        ? instances.reduce((s, m) => s + (m.value ?? 0), 0)
+        : Math.max(...instances.map(m => m.value ?? 0));
+    } else {
+      result.value = instances.reduce((s, m) => s + (m.value ?? 0), 0);
+    }
+  }
+  return result;
+}
+
+function mergeChecks(checksArray) {
+  const merged = {};
+  const allNames = new Set(checksArray.flatMap(c => Object.keys(c)));
+  for (const name of allNames) {
+    const instances = checksArray.map(c => c[name]).filter(Boolean);
+    merged[name] = {
+      name:   instances[0].name,
+      path:   instances[0].path,
+      id:     instances[0].id,
+      passes: instances.reduce((s, x) => s + (x.passes ?? 0), 0),
+      fails:  instances.reduce((s, x) => s + (x.fails  ?? 0), 0),
+    };
+  }
+  return merged;
+}
+
+// ─── Run merge ────────────────────────────────────────────────────────────────
+
+const summaries  = inputFiles.map(f => JSON.parse(fs.readFileSync(f, "utf8")));
+const reqCounts  = summaries.map(s => s.metrics?.http_reqs?.count  || 1);
+const iterCounts = summaries.map(s => s.metrics?.iterations?.count || 1);
+
+const allMetricKeys = new Set(summaries.flatMap(s => Object.keys(s.metrics || {})));
+const mergedMetrics = {};
+for (const key of allMetricKeys) {
+  const instances = summaries.map(s => s.metrics?.[key]).filter(Boolean);
+  if (instances.length > 0) mergedMetrics[key] = mergeMetric(key, instances, reqCounts, iterCounts);
+}
+
+const rootGroups = summaries.map(s => s.root_group).filter(Boolean);
+const firstGroup = rootGroups[0] || {};
+const mergedRootGroup = {
+  name:   firstGroup.name   ?? "",
+  path:   firstGroup.path   ?? "",
+  id:     firstGroup.id     ?? "",
+  groups: firstGroup.groups ?? {},
+  checks: mergeChecks(rootGroups.map(g => g.checks || {})),
+};
+
+const merged = { root_group: mergedRootGroup, metrics: mergedMetrics };
+fs.writeFileSync(outputFile, JSON.stringify(merged, null, 4), "utf8");
+
+// ─── Table renderer ───────────────────────────────────────────────────────────
+
+function fmt(val, decimals = 2) {
+  if (val === undefined || val === null) return "—";
+  return Number(val).toFixed(decimals);
+}
+
+function renderTable(title, headers, rows) {
+  const colWidths = headers.map((h, i) => {
+    const maxData = Math.max(...rows.map(r => String(r[i] ?? "—").length));
+    return Math.max(h.length, maxData);
+  });
+
+  const innerW  = colWidths.reduce((s, w) => s + w + 3, 1);
+  const dline   = "═".repeat(innerW);
+  const hline   = "─".repeat(innerW);
+  const midline = "╠" + colWidths.map(w => "═".repeat(w + 2)).join("╪") + "╣";
+  const rowsep  = "╟" + colWidths.map(w => "─".repeat(w + 2)).join("┼") + "╢";
+  const topbar  = "╔" + colWidths.map(w => "═".repeat(w + 2)).join("╤") + "╗";
+  const botbar  = "╚" + colWidths.map(w => "═".repeat(w + 2)).join("╧") + "╝";
+
+  // Title
+  const tp = Math.floor((innerW - title.length) / 2);
+  console.log(`\n╔${dline}╗`);
+  console.log(`║${" ".repeat(tp)}${title}${" ".repeat(innerW - tp - title.length)}║`);
+  console.log(`╠${dline}╣`);
+
+  // Column headers
+  const hdrRow = headers.map((h, i) => ` ${h.padEnd(colWidths[i])} `).join("│");
+  console.log(`║${hdrRow}║`);
+  console.log(midline);
+
+  // Data rows
+  for (let ri = 0; ri < rows.length; ri++) {
+    const cells = rows[ri].map((cell, i) => ` ${String(cell ?? "—").padEnd(colWidths[i])} `).join("│");
+    console.log(`║${cells}║`);
+    if (ri < rows.length - 1) console.log(rowsep);
+  }
+
+  console.log(`╚${"═".repeat(innerW)}╝`);
+}
+
+
+// ─── Build report data ────────────────────────────────────────────────────────
+
+const m      = mergedMetrics;
+const checks = mergedRootGroup.checks;
+
+// Collect per-API entries from tagged metrics e.g. http_req_duration{name:GET /api/foo}
+const apiMap = {};
+for (const [key, val] of Object.entries(m)) {
+  const match = key.match(/\{name:([^,}]+)/);
+  if (!match) continue;
+  const name = match[1].trim();
+  if (!apiMap[name]) apiMap[name] = {};
+  if (key.startsWith("http_req_duration")) apiMap[name].duration = val;
+}
+
+// ── API Summary Table ─────────────────────────────────────────────────────────
+// Columns: API Name | Transaction Count | Pass Count | Avg (ms) | p(90) (ms) | p(95) (ms)
+
+const dur         = m.http_req_duration ?? {};
+const totalReqs   = m.http_reqs?.count  ?? 0;
+const totalPasses = m.checks?.passes    ?? 0;
+const iters       = m.iterations?.count ?? 0;
+const apiNames    = Object.keys(apiMap);
+
+const apiRows = apiNames.map(name => {
+  const d = apiMap[name].duration ?? {};
+  return [name, iters, iters, fmt(d.avg), fmt(d["p(90)"]), fmt(d["p(95)"])];
+});
+
+// OVERALL always appended as last row
+apiRows.push([
+  "OVERALL",
+  totalReqs.toLocaleString(),
+  totalPasses.toLocaleString(),
+  fmt(dur.avg),
+  fmt(dur["p(90)"]),
+  fmt(dur["p(95)"]),
+]);
+
+renderTable(" API SUMMARY ", ["API Name", "Transaction Count", "Pass Count", "Avg (ms)", "p(90) (ms)", "p(95) (ms)"], apiRows);
+
+if (apiNames.length === 0) {
+  const HW = 79;
+  console.log(`\n┌${"─".repeat(HW)}┐`);
+  console.log(`│  ℹ  No per-API rows found. Tag requests in k6 to get a row per endpoint:  │`);
+  console.log(`│     http.get(url, { tags: { name: 'GET /prod/get/secure' } })              │`);
+  console.log(`└${"─".repeat(HW)}┘`);
+}
+
+// ── Request Phase Breakdown ───────────────────────────────────────────────────
+
+renderTable(
+  " REQUEST PHASE BREAKDOWN ",
+  ["Phase", "Avg (ms)", "Min (ms)", "Max (ms)", "p(90) ms", "p(95) ms"],
+  [
+    ["Blocked",         fmt(m.http_req_blocked?.avg),          fmt(m.http_req_blocked?.min),          fmt(m.http_req_blocked?.max),          fmt(m.http_req_blocked?.["p(90)"]),          fmt(m.http_req_blocked?.["p(95)"])],
+    ["Connecting",      fmt(m.http_req_connecting?.avg),       fmt(m.http_req_connecting?.min),       fmt(m.http_req_connecting?.max),       fmt(m.http_req_connecting?.["p(90)"]),       fmt(m.http_req_connecting?.["p(95)"])],
+    ["TLS Handshaking", fmt(m.http_req_tls_handshaking?.avg),  fmt(m.http_req_tls_handshaking?.min),  fmt(m.http_req_tls_handshaking?.max),  fmt(m.http_req_tls_handshaking?.["p(90)"]),  fmt(m.http_req_tls_handshaking?.["p(95)"])],
+    ["Sending",         fmt(m.http_req_sending?.avg),          fmt(m.http_req_sending?.min),          fmt(m.http_req_sending?.max),          fmt(m.http_req_sending?.["p(90)"]),          fmt(m.http_req_sending?.["p(95)"])],
+    ["Waiting (TTFB)",  fmt(m.http_req_waiting?.avg),          fmt(m.http_req_waiting?.min),          fmt(m.http_req_waiting?.max),          fmt(m.http_req_waiting?.["p(90)"]),          fmt(m.http_req_waiting?.["p(95)"])],
+    ["Receiving",       fmt(m.http_req_receiving?.avg),        fmt(m.http_req_receiving?.min),        fmt(m.http_req_receiving?.max),        fmt(m.http_req_receiving?.["p(90)"]),        fmt(m.http_req_receiving?.["p(95)"])],
+  ]
+);
+
+console.log(`\n  ✅  Merged JSON saved → ${outputFile}`);
+console.log("  ⚠   p(90) / p(95) are weighted approximations across merged files\n");
+
+
+
+

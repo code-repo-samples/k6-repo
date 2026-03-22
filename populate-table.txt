@@ -1,0 +1,239 @@
+"""
+Simple GCP Spanner Loader (Single Process)
+
+Features:
+- Deterministic unique data (no duplicates)
+- Realistic distribution per table
+- Batch inserts (efficient)
+- Minimal retry logic
+- Easy to run on 8GB machine
+
+Usage:
+    python loader.py --start 0 --count 1000000
+"""
+
+import argparse
+import random
+import uuid
+from datetime import datetime, timedelta
+
+from faker import Faker
+import ulid
+
+from google.cloud import spanner
+from google.api_core.exceptions import Aborted, ServiceUnavailable
+
+
+PROJECT_ID = "your-project"
+INSTANCE_ID = "your-instance"
+DATABASE_ID = "your-db"
+
+BATCH_SIZE = 1200  # optimal for 1 node
+
+fake = Faker()
+
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+
+def seed(i):
+    """Seed faker for deterministic output"""
+    fake.seed_instance(i)
+
+
+def gen_email(first, last, i):
+    return f"{first}.{last}.{i}@gmail.com".lower()
+
+
+def gen_phone(i):
+    return f"+1{2000000000 + i}"
+
+
+def now_ts():
+    return spanner.COMMIT_TIMESTAMP
+
+
+# -----------------------------
+# GENERATOR
+# -----------------------------
+
+def generate(i):
+    """
+    Generate all rows for one consumer
+    Returns tuple of lists per table
+    """
+
+    seed(i)
+
+    consumer_id = str(ulid.new())
+
+    first = fake.first_name()
+    last = fake.last_name()
+
+    email = gen_email(first, last, i)
+    phone = gen_phone(i)
+
+    now = now_ts()
+
+    # ---- consumer ----
+    consumer = (
+        consumer_id, first, last, email, phone,
+        fake.date_of_birth(18, 80),
+        random.choice(("male", "female")),
+        "US", "en", True, now, now
+    )
+
+    # ---- address (1–2) ----
+    addresses = []
+    for idx in range(random.randint(1, 2)):
+        addresses.append((
+            consumer_id, str(uuid.uuid4()), 1,
+            fake.street_address(), None,
+            fake.city(), fake.state(),
+            fake.postcode(), "US",
+            idx == 0, True, now, now
+        ))
+
+    # ---- phone (1) ----
+    phone_row = (
+        consumer_id, str(uuid.uuid4()), phone, 1,
+        "+1", True, True, True, now, now
+    )
+
+    # ---- consent (3–4) ----
+    consents = []
+    for _ in range(random.randint(3, 4)):
+        granted = random.random() > 0.3
+        consents.append((
+            consumer_id, str(uuid.uuid4()), random.randint(1, 5),
+            granted,
+            now if granted else None,
+            None,
+            fake.ipv4(),
+            "web",
+            now, now
+        ))
+
+    # ---- interaction (1) ----
+    start_time = datetime.utcnow()
+    interaction = (
+        consumer_id, str(uuid.uuid4()), 1,
+        str(uuid.uuid4()),
+        "web", "click", "success",
+        "mobile",
+        fake.ipv4(),
+        fake.user_agent(),
+        None,
+        start_time,
+        start_time + timedelta(seconds=60),
+        now
+    )
+
+    # ---- external identity (1) ----
+    ext_identity = (
+        consumer_id, str(uuid.uuid4()),
+        "google", f"user_{i}",
+        None, True, now, None
+    )
+
+    return consumer, addresses, phone_row, consents, interaction, ext_identity
+
+
+# -----------------------------
+# COMMIT
+# -----------------------------
+
+def commit_batch(db, batch):
+    """
+    Commit batch with retry on transient errors
+    """
+
+    for attempt in range(3):
+        try:
+            with db.batch() as b:
+
+                b.insert("consumer",
+                    ("consumer_id","first_name","last_name","email_address","phone_number",
+                     "date_of_birth","gender","nationality","preferred_lang",
+                     "is_active","created_at","updated_at"),
+                    [r[0] for r in batch]
+                )
+
+                b.insert("address",
+                    ("consumer_id","address_id","address_type_id","street","district",
+                     "city","state","postal_code","country",
+                     "is_primary","is_active","created_at","updated_at"),
+                    [addr for r in batch for addr in r[1]]
+                )
+
+                b.insert("phone",
+                    ("consumer_id","phone_id","phone_number","phone_type_id",
+                     "country_code","is_primary","is_verified","is_active",
+                     "created_at","updated_at"),
+                    [r[2] for r in batch]
+                )
+
+                b.insert("consent",
+                    ("consumer_id","consent_id","consent_type_id","is_granted",
+                     "granted_at","revoked_at","ip_address","source_channel",
+                     "created_at","updated_at"),
+                    [c for r in batch for c in r[3]]
+                )
+
+                b.insert("interaction",
+                    ("consumer_id","interaction_id","experience_type_id",
+                     "session_id","channel","interaction_type","status",
+                     "device_type","ip_address","user_agent","metadata",
+                     "started_at","ended_at","created_at"),
+                    [r[4] for r in batch]
+                )
+
+                b.insert("external_identity",
+                    ("consumer_id","external_identity_id","identity_provider",
+                     "provider_user_id","access_token_hint","is_active",
+                     "linked_at","last_used_at"),
+                    [r[5] for r in batch]
+                )
+
+            return
+
+        except (Aborted, ServiceUnavailable):
+            if attempt == 2:
+                print("Batch failed after retries")
+            continue
+
+
+# -----------------------------
+# MAIN LOOP
+# -----------------------------
+
+def run(start, count):
+    client = spanner.Client(project=PROJECT_ID)
+    db = client.instance(INSTANCE_ID).database(DATABASE_ID)
+
+    batch = []
+
+    for i in range(start, start + count):
+        batch.append(generate(i))
+
+        if len(batch) >= BATCH_SIZE:
+            commit_batch(db, batch)
+            batch.clear()
+
+    if batch:
+        commit_batch(db, batch)
+
+
+# -----------------------------
+# ENTRY
+# -----------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", type=int, required=True)
+    parser.add_argument("--count", type=int, required=True)
+
+    args = parser.parse_args()
+
+    run(args.start, args.count)
